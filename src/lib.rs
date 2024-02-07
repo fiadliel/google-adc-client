@@ -3,6 +3,7 @@ pub mod machine;
 
 use std::{borrow::Cow, ffi::OsString, fs::File, io::BufReader, str::FromStr, time::Duration};
 
+use chrono::{DateTime, Utc};
 use credentials::{Credentials, SourceCredentials};
 use machine::MetadataServer;
 use oauth2::TokenResponse;
@@ -74,17 +75,21 @@ struct GenerateAccessTokenRequest<'a> {
 #[serde(rename_all = "camelCase")]
 struct GenerateAccessTokenResponse {
     access_token: String,
-    expire_time: String, // TODO: change to timestamp
+    expire_time: DateTime<Utc>,
 }
 
 // AIP-4110
 impl ApplicationDefaultCredentials {
-    pub async fn access_token(&self) -> String {
-        self.access_token_with_scopes(&[] as &[&str]).await
+    pub async fn access_token(&self) -> Result<(String, DateTime<Utc>), reqwest::Error> {
+        self.access_token_with_scopes(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
     }
 
-    pub async fn access_token_with_scopes(&self, scopes: &[impl AsRef<str>]) -> String {
-        match &self.credentials {
+    pub async fn access_token_with_scopes(
+        &self,
+        scopes: &[impl AsRef<str>],
+    ) -> Result<(String, DateTime<Utc>), reqwest::Error> {
+        let result = match &self.credentials {
             CredentialsSource::File(Credentials::ImpersonatedServiceAccount {
                 delegates,
                 service_account_impersonation_url,
@@ -106,31 +111,34 @@ impl ApplicationDefaultCredentials {
                     scope,
                     lifetime: None,
                 };
+
                 let request = client
                     .post(service_account_impersonation_url)
                     .bearer_auth(underlying)
                     .json(&body)
-                    .build()
-                    .unwrap();
+                    .build()?;
 
-                client
-                    .execute(request)
-                    .await
-                    .unwrap()
-                    .json::<GenerateAccessTokenResponse>()
-                    .await
-                    .unwrap()
-                    .access_token
+                let response = client.execute(request).await?;
+
+                response.error_for_status_ref()?;
+
+                let payload = response.json::<GenerateAccessTokenResponse>().await?;
+
+                (payload.access_token, payload.expire_time)
             }
-            CredentialsSource::File(Credentials::SourceCredentials(creds)) => {
+            CredentialsSource::File(Credentials::SourceCredentials(creds)) => (
                 self.access_token_from_source_credentials(scopes, &creds)
-                    .await
-            }
-            CredentialsSource::MetadataServer(server) => self
-                .access_token_from_metadata_server(None, scopes, server)
-                .await
-                .unwrap(),
-        }
+                    .await,
+                Utc::now(),
+            ),
+            CredentialsSource::MetadataServer(server) => (
+                self.access_token_from_metadata_server(None, scopes, server)
+                    .await,
+                Utc::now(),
+            ),
+        };
+
+        Ok(result)
     }
 
     async fn access_token_from_source_credentials(
@@ -183,7 +191,7 @@ impl ApplicationDefaultCredentials {
         account: Option<&str>,
         scopes: &[impl AsRef<str>],
         metadata_server: &MetadataServer,
-    ) -> Result<String, String> {
+    ) -> String {
         let qs = if scopes.is_empty() {
             Cow::Borrowed("")
         } else {
@@ -201,10 +209,7 @@ impl ApplicationDefaultCredentials {
             None => format!("instance/service-accounts/default/token{qs}"),
         };
 
-        metadata_server
-            .get(suffix)
-            .await
-            .map_err(|_| "Error getting access token".to_string())
+        metadata_server.get(suffix).await.unwrap()
     }
 
     pub fn id_token(_audience: &str) -> String {
