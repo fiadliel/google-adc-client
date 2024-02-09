@@ -10,6 +10,7 @@ use credentials::{
     SourceCredentials,
 };
 use machine::MetadataServer;
+use serde::Serialize;
 
 enum TokenState {
     Invalid,
@@ -17,6 +18,7 @@ enum TokenState {
     Fresh,
 }
 
+#[derive(Clone)]
 pub struct AccessToken {
     access_token: String,
     refresh_token: Option<String>,
@@ -104,13 +106,35 @@ impl<'a> AccessTokenWithScopesSource<'a> {
             AccessTokenWithScopesSourceEnum::ImpersonatedServiceAccount(isa) => {
                 isa.access_token_with_scopes(scopes).await
             }
-            AccessTokenWithScopesSourceEnum::ServiceAccount(_sa) => todo!(), //sa.access_token().await,
+            AccessTokenWithScopesSourceEnum::ServiceAccount(sa) => {
+                todo!()
+            }
         }
     }
 }
 
-// AIP-4110
+pub struct SignedJwtTokenSource<'a> {
+    source: &'a ServiceAccountCredentials,
+}
+
+impl<'a> SignedJwtTokenSource<'a> {
+    pub async fn signed_jwt_token(&self, audience: &str) -> Result<AccessToken, reqwest::Error> {
+        self.source.signed_jwt_token(audience).await
+    }
+
+    pub async fn signed_jwt_token_with_claims<A: Serialize>(
+        &self,
+        audience: &str,
+        claims: A,
+    ) -> Result<AccessToken, reqwest::Error> {
+        self.source
+            .signed_jwt_token_with_claims(audience, claims)
+            .await
+    }
+}
+
 impl ApplicationDefaultCredentials {
+    /// Provides an access token from Google IAM.
     pub async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
         match &self.credentials {
             CredentialsSource::File(Credentials::ImpersonatedServiceAccount(isa)) => {
@@ -123,6 +147,8 @@ impl ApplicationDefaultCredentials {
         }
     }
 
+    /// Provides access to provide scopes with the request. This is not possible
+    /// for all types of credentials, so this returns [None] in those cases.
     pub async fn access_token_with_scopes_source(&self) -> Option<AccessTokenWithScopesSource<'_>> {
         match &self.credentials {
             CredentialsSource::File(Credentials::ImpersonatedServiceAccount(isa)) => {
@@ -135,6 +161,31 @@ impl ApplicationDefaultCredentials {
             )) => Some(AccessTokenWithScopesSource {
                 source: AccessTokenWithScopesSourceEnum::ServiceAccount(sa),
             }),
+            _ => None,
+        }
+    }
+
+    /// Provides a self-signed JWT token where possible, but falls back to
+    /// the less efficient call to IAM in other cases.
+    pub async fn access_token_with_audience(
+        &self,
+        audience: &str,
+    ) -> Result<AccessToken, reqwest::Error> {
+        match &self.credentials {
+            CredentialsSource::File(Credentials::SourceCredentials(
+                SourceCredentials::ServiceAccount(sa),
+            )) => sa.signed_jwt_token(audience).await,
+            _ => self.access_token().await,
+        }
+    }
+
+    /// Provides access to create signed JWTs. This is an optimisation, and is
+    /// also necessary for certain APIs, like API Gateway.
+    pub async fn signed_jwt_token_source(&self) -> Option<SignedJwtTokenSource<'_>> {
+        match &self.credentials {
+            CredentialsSource::File(Credentials::SourceCredentials(
+                SourceCredentials::ServiceAccount(sa),
+            )) => Some(SignedJwtTokenSource { source: sa }),
             _ => None,
         }
     }

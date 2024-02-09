@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap, fmt::Debug};
 
-use chrono::Utc;
-use oauth2::TokenResponse;
-use serde::Deserialize;
+use chrono::{Duration, Utc};
+use oauth2::{ClientAssertion, ClientId, TokenResponse};
+use pkcs8::DecodePrivateKey;
+use rsa::pkcs1::EncodeRsaPrivateKey;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     requests::{GenerateAccessTokenRequest, GenerateAccessTokenResponse},
@@ -72,20 +74,94 @@ pub struct ServiceAccountCredentials {
     pub universe_domain: String,
 }
 
+#[derive(Serialize)]
+struct ServiceAccountJwtClaims<'a> {
+    iss: &'a str,
+    sub: &'a str,
+    aud: &'a str,
+    scope: &'a str,
+    iat: i64,
+    exp: i64,
+}
+
+impl ServiceAccountCredentials {
+    pub async fn signed_jwt_token(&self, audience: &str) -> Result<AccessToken, reqwest::Error> {
+        self.signed_jwt_token_with_maybe_claims(audience, None::<()>)
+            .await
+    }
+
+    pub async fn signed_jwt_token_with_claims<A: Serialize>(
+        &self,
+        audience: &str,
+        claims: A,
+    ) -> Result<AccessToken, reqwest::Error> {
+        self.signed_jwt_token_with_maybe_claims(audience, Some(claims))
+            .await
+    }
+
+    async fn signed_jwt_token_with_maybe_claims<A: Serialize>(
+        &self,
+        audience: &str,
+        claims: Option<A>,
+    ) -> Result<AccessToken, reqwest::Error> {
+        let iat = Utc::now();
+        let exp = iat.checked_add_signed(Duration::hours(1)).unwrap();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(self.private_key_id.clone());
+
+        let my_claims = ServiceAccountJwtClaims {
+            iss: &self.client_email,
+            sub: &self.client_email,
+            aud: audience,
+            scope: "https://www.googleapis.com/auth/cloud-platform",
+            iat: iat.timestamp(),
+            exp: exp.timestamp(),
+        };
+
+        let key = rsa::RsaPrivateKey::from_pkcs8_pem(&self.private_key).unwrap();
+
+        let jwt = jsonwebtoken::encode(
+            &header,
+            &my_claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(&key.to_pkcs1_der().unwrap().as_bytes()),
+        )
+        .unwrap();
+
+        Ok(AccessToken {
+            access_token: jwt,
+            refresh_token: None,
+            expiry_time: exp,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ServiceAccountImpersonationInfo {
+    pub token_lifetime_seconds: i32, // TODO: what int type?
+}
+
+// TODO: haven't verified any of the option types here - just
+// getting example from AWS to fully parse
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct ExternalAccountCredentials {
-    pub client_id: String,
-    pub client_secret: String,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
     pub audience: String,
     pub subject_token_type: String,
     pub service_account_impersonation_url: Option<String>,
     pub token_url: String,
     pub credential_source: CredentialSource,
-    pub token_info_url: String,
-    pub service_account_impersonation: String, // TODO: this is a type
-    pub quota_project_id: String,
-    pub workforce_pool_user_project: String,
-    pub universe_domain: String,
+    pub token_info_url: Option<String>,
+    pub service_account_impersonation: Option<ServiceAccountImpersonationInfo>,
+    pub quota_project_id: Option<String>,
+    pub workforce_pool_user_project: Option<String>,
+    pub universe_domain: Option<String>,
+}
+
+impl ExternalAccountCredentials {
+    async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        todo!()
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -100,6 +176,12 @@ pub struct ExternalAccountAuthorizedUserCredentials {
     pub quota_project_id: String,
 }
 
+impl ExternalAccountAuthorizedUserCredentials {
+    async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        todo!()
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct GdchServiceAccountCredentials {
     pub format_version: String,
@@ -109,6 +191,12 @@ pub struct GdchServiceAccountCredentials {
     pub private_key_id: String,
     pub private_key: String,
     pub token_uri: String,
+}
+
+impl GdchServiceAccountCredentials {
+    async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        todo!()
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -126,14 +214,60 @@ pub(crate) enum SourceCredentials {
     GdchServiceAccount(GdchServiceAccountCredentials),
 }
 
+#[derive(Deserialize)]
+struct Blah {
+    access_token: String,
+    expires_in: i32,
+    token_type: String,
+}
+
 impl SourceCredentials {
     pub(crate) async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
         match self {
             SourceCredentials::AuthorizedUser(u) => u.access_token().await,
-            SourceCredentials::ServiceAccount(_) => todo!(),
-            SourceCredentials::ExternalAccount(_) => todo!(),
-            SourceCredentials::ExternalAccountAuthorizedUser(_) => todo!(),
-            SourceCredentials::GdchServiceAccount(_) => todo!(),
+            SourceCredentials::ServiceAccount(sa) => {
+                let jwt_token = sa.signed_jwt_token(&sa.token_uri).await?;
+
+                let client = reqwest::Client::new();
+
+                let response = client
+                    .post(&sa.token_uri)
+                    .form(&[
+                        ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                        ("assertion", jwt_token.as_str()),
+                        ("scope", "https://www.googleapis.com/auth/cloud-platform"),
+                    ])
+                    .send()
+                    .await?;
+
+                let body: Blah = response.json().await?;
+
+                //response.error_for_status_ref()?;
+
+                //let body = response.text().await?;
+
+                Ok(AccessToken {
+                    access_token: body.access_token,
+                    refresh_token: None,
+                    expiry_time: Utc::now(),
+                })
+            }
+            SourceCredentials::ExternalAccount(ea) => ea.access_token().await,
+            SourceCredentials::ExternalAccountAuthorizedUser(u) => u.access_token().await,
+            SourceCredentials::GdchServiceAccount(sa) => sa.access_token().await,
+        }
+    }
+
+    pub(crate) async fn access_token_with_audience(
+        &self,
+        audience: &str,
+    ) -> Result<AccessToken, reqwest::Error> {
+        match self {
+            SourceCredentials::AuthorizedUser(u) => u.access_token().await,
+            SourceCredentials::ServiceAccount(sa) => sa.signed_jwt_token(audience).await,
+            SourceCredentials::ExternalAccount(ea) => ea.access_token().await,
+            SourceCredentials::ExternalAccountAuthorizedUser(u) => u.access_token().await,
+            SourceCredentials::GdchServiceAccount(sa) => sa.access_token().await,
         }
     }
 }
@@ -166,7 +300,10 @@ impl ImpersonatedServiceAccountCredentials {
         scopes: &[&str],
     ) -> Result<AccessToken, reqwest::Error> {
         // Use cloud-platform scope, need to access IAM Service Account Credentials API.
-        let underlying = self.source_credentials.access_token().await?;
+        let underlying = self
+            .source_credentials
+            .access_token_with_audience("https://oauth2.googleapis.com/token")
+            .await?;
 
         let delegates = self
             .delegates
@@ -203,6 +340,7 @@ impl ImpersonatedServiceAccountCredentials {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
 pub enum CredentialSource {
     Aws {
         environment_id: String,
