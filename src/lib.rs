@@ -1,21 +1,15 @@
-pub mod credentials;
-pub mod machine;
+mod credentials;
+mod machine;
+mod requests;
 
-use std::{borrow::Cow, ffi::OsString, fs::File, io::BufReader, str::FromStr, time::Duration};
+use std::{ffi::OsString, fs::File, io::BufReader, str::FromStr};
 
-use chrono::{DateTime, Utc};
-use credentials::{Credentials, SourceCredentials};
+use chrono::{DateTime, Duration, Utc};
+use credentials::{
+    Credentials, ImpersonatedServiceAccountCredentials, ServiceAccountCredentials,
+    SourceCredentials,
+};
 use machine::MetadataServer;
-use oauth2::TokenResponse;
-use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
-
-#[derive(Debug)]
-pub struct Token {
-    access_token: String,
-    refresh_token: Option<String>,
-    expiry: Instant,
-}
 
 enum TokenState {
     Invalid,
@@ -23,15 +17,33 @@ enum TokenState {
     Fresh,
 }
 
-impl Token {
-    const REFRESH_THRESHOLD: Duration = Duration::from_secs(60 * 3 + 45);
+pub struct AccessToken {
+    access_token: String,
+    refresh_token: Option<String>,
+    expiry_time: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("token", &"********")
+            .field("expiry_time", &self.expiry_time)
+            .finish()
+    }
+}
+
+impl AccessToken {
+    // TODO: this should be possible to make const in chrono 0.5
+    fn refresh_threshold() -> Duration {
+        Duration::minutes(3) + Duration::seconds(45)
+    }
 
     fn token_state_with_early_expiry(&self, early_expiry: Duration) -> TokenState {
-        let time_to_expiry = Instant::now().duration_since(self.expiry);
+        let time_to_expiry = self.expiry_time.signed_duration_since(Utc::now());
 
         if time_to_expiry <= early_expiry {
             TokenState::Invalid
-        } else if time_to_expiry <= Self::REFRESH_THRESHOLD {
+        } else if time_to_expiry <= Self::refresh_threshold() {
             TokenState::Stale
         } else {
             TokenState::Fresh
@@ -39,19 +51,27 @@ impl Token {
     }
 
     fn token_state(&self) -> TokenState {
-        self.token_state_with_early_expiry(Duration::ZERO)
+        self.token_state_with_early_expiry(Duration::zero())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.access_token
+    }
+
+    pub fn expiry_time(&self) -> &DateTime<Utc> {
+        &self.expiry_time
     }
 }
 
 #[derive(Debug)]
 pub struct ApplicationDefaultCredentials {
-    pub credentials: CredentialsSource,
+    pub(crate) credentials: CredentialsSource,
     pub quota_project_id: Option<String>,
     pub use_client_certificate: bool,
 }
 
 #[derive(Debug)]
-pub enum CredentialsSource {
+pub(crate) enum CredentialsSource {
     File(Credentials),
     MetadataServer(MetadataServer),
 }
@@ -60,160 +80,63 @@ impl ApplicationDefaultCredentials {
     pub fn builder() -> ApplicationDefaultCredentialsBuilder {
         ApplicationDefaultCredentialsBuilder::new()
     }
+
+    pub async fn new() -> Result<Self, String> {
+        ApplicationDefaultCredentialsBuilder::new().build().await
+    }
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct GenerateAccessTokenRequest<'a> {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    delegates: Vec<&'a str>,
-    scope: Vec<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lifetime: Option<u32>,
+pub struct AccessTokenWithScopesSource<'a> {
+    source: AccessTokenWithScopesSourceEnum<'a>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct GenerateAccessTokenResponse {
-    access_token: String,
-    expire_time: DateTime<Utc>,
+pub(crate) enum AccessTokenWithScopesSourceEnum<'a> {
+    ImpersonatedServiceAccount(&'a ImpersonatedServiceAccountCredentials),
+    ServiceAccount(&'a ServiceAccountCredentials),
+}
+
+impl<'a> AccessTokenWithScopesSource<'a> {
+    pub async fn access_token_with_scopes(
+        &self,
+        scopes: &[&str],
+    ) -> Result<AccessToken, reqwest::Error> {
+        match &self.source {
+            AccessTokenWithScopesSourceEnum::ImpersonatedServiceAccount(isa) => {
+                isa.access_token_with_scopes(scopes).await
+            }
+            AccessTokenWithScopesSourceEnum::ServiceAccount(_sa) => todo!(), //sa.access_token().await,
+        }
+    }
 }
 
 // AIP-4110
 impl ApplicationDefaultCredentials {
-    pub async fn access_token(&self) -> Result<(String, DateTime<Utc>), reqwest::Error> {
-        self.access_token_with_scopes(&["https://www.googleapis.com/auth/cloud-platform"])
-            .await
-    }
-
-    pub async fn access_token_with_scopes(
-        &self,
-        scopes: &[impl AsRef<str>],
-    ) -> Result<(String, DateTime<Utc>), reqwest::Error> {
-        let result = match &self.credentials {
-            CredentialsSource::File(Credentials::ImpersonatedServiceAccount {
-                delegates,
-                service_account_impersonation_url,
-                source_credentials,
-            }) => {
-                let underlying = self
-                    .access_token_from_source_credentials(&[] as &[&str], source_credentials)
-                    .await;
-
-                let delegates = delegates
-                    .into_iter()
-                    .map(|d| d.as_ref())
-                    .collect::<Vec<_>>();
-                let client = reqwest::Client::new();
-                let scope = scopes.into_iter().map(|s| s.as_ref()).collect::<Vec<_>>();
-
-                let body = GenerateAccessTokenRequest {
-                    delegates,
-                    scope,
-                    lifetime: None,
-                };
-
-                let request = client
-                    .post(service_account_impersonation_url)
-                    .bearer_auth(underlying)
-                    .json(&body)
-                    .build()?;
-
-                let response = client.execute(request).await?;
-
-                response.error_for_status_ref()?;
-
-                let payload = response.json::<GenerateAccessTokenResponse>().await?;
-
-                (payload.access_token, payload.expire_time)
+    pub async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        match &self.credentials {
+            CredentialsSource::File(Credentials::ImpersonatedServiceAccount(isa)) => {
+                isa.access_token().await
             }
-            CredentialsSource::File(Credentials::SourceCredentials(creds)) => (
-                self.access_token_from_source_credentials(scopes, &creds)
-                    .await,
-                Utc::now(),
-            ),
-            CredentialsSource::MetadataServer(server) => (
-                self.access_token_from_metadata_server(None, scopes, server)
-                    .await,
-                Utc::now(),
-            ),
-        };
-
-        Ok(result)
-    }
-
-    async fn access_token_from_source_credentials(
-        &self,
-        scopes: &[impl AsRef<str>],
-        credentials: &SourceCredentials,
-    ) -> String {
-        match credentials {
-            SourceCredentials::AuthorizedUser(user_credentials) => {
-                let oauth = oauth2::basic::BasicClient::new(
-                    oauth2::ClientId::new(user_credentials.client_id.clone()),
-                    Some(oauth2::ClientSecret::new(
-                        user_credentials.client_secret.clone(),
-                    )),
-                    oauth2::AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_owned())
-                        .unwrap(),
-                    Some(
-                        oauth2::TokenUrl::new(
-                            "https://accounts.google.com/o/oauth2/token".to_owned(),
-                        )
-                        .unwrap(),
-                    ),
-                );
-
-                oauth
-                    .exchange_refresh_token(&oauth2::RefreshToken::new(
-                        user_credentials.refresh_token.clone(),
-                    ))
-                    .add_scopes(
-                        scopes
-                            .into_iter()
-                            .map(|scope| oauth2::Scope::new(scope.as_ref().to_string())),
-                    )
-                    .request_async(oauth2::reqwest::async_http_client)
-                    .await
-                    .unwrap()
-                    .access_token()
-                    .secret()
-                    .to_string()
+            CredentialsSource::File(Credentials::SourceCredentials(source_credentials)) => {
+                source_credentials.access_token().await
             }
-            SourceCredentials::ServiceAccount(_) => todo!(),
-            SourceCredentials::ExternalAccount(_) => todo!(),
-            SourceCredentials::ExternalAccountAuthorizedUser(_) => todo!(),
-            SourceCredentials::GdchServiceAccount(_) => todo!(),
+            CredentialsSource::MetadataServer(ms) => ms.access_token().await,
         }
     }
 
-    async fn access_token_from_metadata_server(
-        &self,
-        account: Option<&str>,
-        scopes: &[impl AsRef<str>],
-        metadata_server: &MetadataServer,
-    ) -> String {
-        let qs = if scopes.is_empty() {
-            Cow::Borrowed("")
-        } else {
-            let scopes_value = scopes
-                .into_iter()
-                .map(|s| s.as_ref())
-                .collect::<Vec<_>>()
-                .join(",");
-
-            Cow::Owned(format!("?scopes={}", urlencoding::encode(&scopes_value)))
-        };
-
-        let suffix = match account {
-            Some(acc) => format!("instance/service-accounts/{acc}/token{qs}"),
-            None => format!("instance/service-accounts/default/token{qs}"),
-        };
-
-        metadata_server.get(suffix).await.unwrap()
-    }
-
-    pub fn id_token(_audience: &str) -> String {
-        String::from("IdToken")
+    pub async fn access_token_with_scopes_source(&self) -> Option<AccessTokenWithScopesSource<'_>> {
+        match &self.credentials {
+            CredentialsSource::File(Credentials::ImpersonatedServiceAccount(isa)) => {
+                Some(AccessTokenWithScopesSource {
+                    source: AccessTokenWithScopesSourceEnum::ImpersonatedServiceAccount(isa),
+                })
+            }
+            CredentialsSource::File(Credentials::SourceCredentials(
+                SourceCredentials::ServiceAccount(sa),
+            )) => Some(AccessTokenWithScopesSource {
+                source: AccessTokenWithScopesSourceEnum::ServiceAccount(sa),
+            }),
+            _ => None,
+        }
     }
 
     fn from_application_default_credentials(
@@ -344,15 +267,12 @@ impl ApplicationDefaultCredentialsBuilder {
 mod tests {
     use crate::ApplicationDefaultCredentials;
 
-    // #[tokio::test]
-    // async fn get_token() {
-    //     let adc = ApplicationDefaultCredentials::builder().build().unwrap();
-    //     insta::assert_debug_snapshot!(
-    //         adc.access_token(&[
-    //             "https://www.googleapis.com/auth/cloud-platform",
-    //             "https://www.googleapis.com/auth/cloud-platform.read-only"
-    //         ])
-    //         .await
-    //     )
-    // }
+    #[tokio::test]
+    async fn get_token() {
+        let adc = ApplicationDefaultCredentials::builder()
+            .build()
+            .await
+            .unwrap();
+        insta::assert_debug_snapshot!(adc.access_token().await)
+    }
 }

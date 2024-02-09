@@ -4,11 +4,14 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
+use chrono::Utc;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     StatusCode,
 };
 use tokio::{fs::File, io::AsyncReadExt as _, net::lookup_host, select, sync::OnceCell};
+
+use crate::AccessToken;
 
 const METADATA_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
 const METADATA_HOST_ENV: &str = "GCE_METADATA_HOST";
@@ -23,6 +26,19 @@ pub struct MetadataServer {
     project_id: OnceCell<String>,
     numeric_project_id: OnceCell<String>,
     instance_id: OnceCell<String>,
+}
+
+impl MetadataServer {
+    pub async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        Ok(AccessToken {
+            access_token: self
+                .get("instance/service-accounts/default/token")
+                .await
+                .unwrap(),
+            refresh_token: None,
+            expiry_time: Utc::now(),
+        })
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -1,15 +1,61 @@
 use std::collections::HashMap;
 
+use chrono::Utc;
+use oauth2::TokenResponse;
 use serde::Deserialize;
 
+use crate::{
+    requests::{GenerateAccessTokenRequest, GenerateAccessTokenResponse},
+    AccessToken,
+};
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-pub struct AuthorizedUserCredentials {
-    pub client_id: String,
-    pub client_secret: String,
-    pub quota_project_id: Option<String>,
-    pub refresh_token: String,
-    pub universe_domain: String, // auth_uri?
-                                 // token_uri?
+pub(crate) struct AuthorizedUserCredentials {
+    pub(crate) client_id: String,
+    pub(crate) client_secret: String,
+    pub(crate) quota_project_id: Option<String>,
+    pub(crate) refresh_token: String,
+    pub(crate) universe_domain: String, // auth_uri?
+                                        // token_uri?
+}
+
+impl AuthorizedUserCredentials {
+    async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        self.access_token_with_scopes(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
+    }
+
+    async fn access_token_with_scopes(
+        &self,
+        scopes: &[&str],
+    ) -> Result<AccessToken, reqwest::Error> {
+        let oauth = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new(self.client_id.clone()),
+            Some(oauth2::ClientSecret::new(self.client_secret.clone())),
+            oauth2::AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_owned()).unwrap(),
+            Some(
+                oauth2::TokenUrl::new("https://accounts.google.com/o/oauth2/token".to_owned())
+                    .unwrap(),
+            ),
+        );
+
+        let result = oauth
+            .exchange_refresh_token(&oauth2::RefreshToken::new(self.refresh_token.clone()))
+            .add_scopes(
+                scopes
+                    .into_iter()
+                    .map(|scope| oauth2::Scope::new(scope.to_string())),
+            )
+            .request_async(oauth2::reqwest::async_http_client)
+            .await
+            .unwrap();
+
+        Ok(AccessToken {
+            access_token: result.access_token().secret().to_owned(),
+            refresh_token: None,
+            expiry_time: Utc::now(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -67,7 +113,7 @@ pub struct GdchServiceAccountCredentials {
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
-pub enum SourceCredentials {
+pub(crate) enum SourceCredentials {
     #[serde(rename = "authorized_user")]
     AuthorizedUser(AuthorizedUserCredentials),
     #[serde(rename = "service_account")]
@@ -80,18 +126,80 @@ pub enum SourceCredentials {
     GdchServiceAccount(GdchServiceAccountCredentials),
 }
 
+impl SourceCredentials {
+    pub(crate) async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        match self {
+            SourceCredentials::AuthorizedUser(u) => u.access_token().await,
+            SourceCredentials::ServiceAccount(_) => todo!(),
+            SourceCredentials::ExternalAccount(_) => todo!(),
+            SourceCredentials::ExternalAccountAuthorizedUser(_) => todo!(),
+            SourceCredentials::GdchServiceAccount(_) => todo!(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
-pub enum Credentials {
+pub(crate) enum Credentials {
     #[serde(rename = "impersonated_service_account")]
-    ImpersonatedServiceAccount {
-        delegates: Vec<String>,
-        service_account_impersonation_url: String,
-        source_credentials: SourceCredentials,
-        // universe_domain: Option<String>, TODO: is this ever set?
-    },
+    ImpersonatedServiceAccount(ImpersonatedServiceAccountCredentials),
     #[serde(untagged)]
     SourceCredentials(SourceCredentials),
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ImpersonatedServiceAccountCredentials {
+    delegates: Vec<String>,
+    service_account_impersonation_url: String,
+    source_credentials: SourceCredentials,
+    // universe_domain: Option<String>, TODO: is this ever set?
+}
+
+impl ImpersonatedServiceAccountCredentials {
+    pub(crate) async fn access_token(&self) -> Result<AccessToken, reqwest::Error> {
+        self.access_token_with_scopes(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
+    }
+
+    pub(crate) async fn access_token_with_scopes(
+        &self,
+        scopes: &[&str],
+    ) -> Result<AccessToken, reqwest::Error> {
+        // Use cloud-platform scope, need to access IAM Service Account Credentials API.
+        let underlying = self.source_credentials.access_token().await?;
+
+        let delegates = self
+            .delegates
+            .iter()
+            .map(|d| d.as_ref())
+            .collect::<Vec<_>>();
+        let client = reqwest::Client::new();
+        let scope = scopes.into_iter().map(|s| s.as_ref()).collect::<Vec<_>>();
+
+        let body = GenerateAccessTokenRequest {
+            delegates,
+            scope,
+            lifetime: None,
+        };
+
+        let request = client
+            .post(&self.service_account_impersonation_url)
+            .bearer_auth(underlying.access_token)
+            .json(&body)
+            .build()?;
+
+        let response = client.execute(request).await?;
+
+        response.error_for_status_ref()?;
+
+        let payload = response.json::<GenerateAccessTokenResponse>().await?;
+
+        Ok(AccessToken {
+            access_token: payload.access_token,
+            refresh_token: None,
+            expiry_time: payload.expire_time,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
