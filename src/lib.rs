@@ -26,7 +26,7 @@ pub struct AccessToken {
 impl std::fmt::Debug for AccessToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccessToken")
-            .field("token", &"********")
+            .field("token", &"ya29.********")
             .field("expiry_time", &self.expiry_time)
             .finish()
     }
